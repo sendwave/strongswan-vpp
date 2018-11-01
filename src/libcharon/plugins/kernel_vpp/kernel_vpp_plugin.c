@@ -9,6 +9,16 @@
 #undef vl_typedefs
 #undef vl_endianfun
 
+/*
+ * NOTE: This is to get around the fact that both src/vppinfra/dlmalloc.h (from
+ *       VPP) and src/libstrongswan/resolver/resolver_response.h (from
+ *       StrongSwan) define INSECURE. Yes, they both define that value, without
+ *       any prefix.
+ *
+ *       *sigh*
+ *
+ */
+#undef INSECURE
 #include "kernel_vpp_plugin.h"
 #include "kernel_vpp_shared.h"
 #include "kernel_vpp_ipsec.h"
