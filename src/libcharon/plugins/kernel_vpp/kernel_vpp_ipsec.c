@@ -98,7 +98,7 @@ typedef struct {
     /** VPP SA ID */
     uint32_t sa_id;
     /** Data required to add/delete SA to VPP */
-    vl_api_ipsec_sad_add_del_entry_t *mp;
+    vl_api_ipsec_sad_entry_add_del_t *mp;
 } sa_t;
 
 /**
@@ -191,6 +191,7 @@ static void manage_route(private_kernel_vpp_ipsec_t *this, bool add,
     {
         if (route_exist)
         {
+			DBG2(DBG_KNL, "add route but it exist %d", route->refs);
             route->refs++;
         }
         else
@@ -206,13 +207,14 @@ static void manage_route(private_kernel_vpp_ipsec_t *this, bool add,
             );
             this->routes->insert_last(this->routes, route);
             charon->kernel->add_route(charon->kernel,
-                 dst_net->get_address(dst_net), prefixlen, dst, NULL, if_name);
+                 dst_net->get_address(dst_net), prefixlen, dst, gateway, if_name);
         }
     }
     else
     {
         if (!route_exist || --route->refs > 0)
         {
+			DBG2(DBG_KNL, "del route but it not exist or refs is %d", route->refs);
             return;
         }
         DBG2(DBG_KNL, "uninstalling route: %H/%d via %H dev %s",
@@ -220,7 +222,7 @@ static void manage_route(private_kernel_vpp_ipsec_t *this, bool add,
         this->routes->remove(this->routes, route, NULL);
         route_destroy(route);
         charon->kernel->del_route(charon->kernel, dst_net->get_address(dst_net),
-             prefixlen, dst, NULL, if_name);
+             prefixlen, dst, gateway, if_name);
     }
 }
 
@@ -358,9 +360,9 @@ static uint32_t get_sw_if_index(char *interface)
     mp = vl_msg_api_alloc (sizeof (*mp));
     memset(mp, 0, sizeof(*mp));
     mp->_vl_msg_id = ntohs(VL_API_SW_INTERFACE_DUMP);
-    mp->name_filter_valid = 1;
-    strcpy(mp->name_filter, interface);
-    if (vac->send_dump(vac, (char *)mp, sizeof(*mp), &out, &out_len))
+    mp->name_filter_valid = TRUE;
+	strncpy(mp->name_filter, interface, sizeof(mp->name_filter)-1);
+    if (vac->send(vac, (char *)mp, sizeof(*mp), &out, &out_len))
     {
         goto error;
     }
@@ -450,25 +452,26 @@ error:
 
 static int bypass_port(bool add, uint32_t spd_id, uint16_t port)
 {
-    vl_api_ipsec_spd_add_del_entry_t *mp;
-    vl_api_ipsec_spd_add_del_entry_reply_t *rmp;
+    vl_api_ipsec_spd_entry_add_del_t *mp;
+    vl_api_ipsec_spd_entry_add_del_reply_t *rmp;
     char *out = NULL;
     int out_len;
     status_t rv = FAILED;
 
+	DBG2(DBG_KNL, "bypass_port [%s] spd_id %d port %d", add?"ADD":"DEL", spd_id, port);
+
     mp = vl_msg_api_alloc (sizeof (*mp));
     memset(mp, 0, sizeof(*mp));
 
-    mp->_vl_msg_id = ntohs(VL_API_IPSEC_SPD_ADD_DEL_ENTRY);
-    mp->is_add = add;
-    mp->spd_id = ntohl(spd_id);
-    mp->priority = ntohl(INT_MAX - POLICY_PRIORITY_PASS);
-    mp->is_outbound = 0;
-    mp->policy = 0;
-    mp->is_ip_any = 1;
-    memset(mp->local_address_stop, 0xFF, 16);
-    memset(mp->remote_address_stop, 0xFF, 16);
-    mp->protocol = IPPROTO_ESP;
+	mp->_vl_msg_id = ntohs(VL_API_IPSEC_SPD_ENTRY_ADD_DEL);
+	mp->is_add = add;
+	mp->entry.spd_id = ntohl(spd_id);
+	mp->entry.priority = ntohl(INT_MAX - POLICY_PRIORITY_PASS);
+	mp->entry.is_outbound = 0;
+	mp->entry.policy = ntohl(IPSEC_API_SPD_ACTION_BYPASS);
+	memset(mp->entry.local_address_stop.un.ip6, 0xFF, 16);
+	memset(mp->entry.remote_address_stop.un.ip6, 0xFF, 16);
+	mp->entry.protocol = IP_API_PROTO_ESP;
     if (vac->send(vac, (char *)mp, sizeof(*mp), &out, &out_len))
     {
         DBG1(DBG_KNL, "vac %s SPD entry failed", add ? "adding" : "removing");
@@ -480,7 +483,7 @@ static int bypass_port(bool add, uint32_t spd_id, uint16_t port)
         DBG1(DBG_KNL, "%s SPD entry failed rv:%d", add ? "add" : "remove", ntohl(rmp->retval));
         goto error;
     }
-    mp->is_outbound = 1;
+    mp->entry.is_outbound = 1;
     if (vac->send(vac, (char *)mp, sizeof(*mp), &out, &out_len))
     {
         DBG1(DBG_KNL, "vac %s SPD entry failed", add ? "adding" : "removing");
@@ -492,8 +495,8 @@ static int bypass_port(bool add, uint32_t spd_id, uint16_t port)
         DBG1(DBG_KNL, "%s SPD entry failed rv:%d", add ? "add" : "remove", ntohl(rmp->retval));
         goto error;
     }
-    mp->is_outbound = 0;
-    mp->protocol = IPPROTO_AH;
+    mp->entry.is_outbound = 0;
+    mp->entry.protocol = IP_API_PROTO_AH;
     if (vac->send(vac, (char *)mp, sizeof(*mp), &out, &out_len))
     {
         DBG1(DBG_KNL, "vac %s SPD entry failed", add ? "adding" : "removing");
@@ -505,7 +508,7 @@ static int bypass_port(bool add, uint32_t spd_id, uint16_t port)
         DBG1(DBG_KNL, "%s SPD entry failed rv:%d", add ? "add" : "remove", ntohl(rmp->retval));
         goto error;
     }
-    mp->is_outbound = 1;
+    mp->entry.is_outbound = 1;
     if (vac->send(vac, (char *)mp, sizeof(*mp), &out, &out_len))
     {
         DBG1(DBG_KNL, "vac %s SPD entry failed", add ? "adding" : "removing");
@@ -517,10 +520,10 @@ static int bypass_port(bool add, uint32_t spd_id, uint16_t port)
         DBG1(DBG_KNL, "%s SPD entry failed rv:%d", add ? "add" : "remove", ntohl(rmp->retval));
         goto error;
     }
-    mp->is_outbound = 0;
-    mp->protocol = IPPROTO_UDP;
-    mp->local_port_start = mp->local_port_stop = ntohs(port);
-    mp->remote_port_start = mp->remote_port_stop = ntohs(port);
+    mp->entry.is_outbound = 0;
+    mp->entry.protocol = IP_API_PROTO_UDP;
+    mp->entry.local_port_start = mp->entry.local_port_stop = ntohs(port);
+    mp->entry.remote_port_start = mp->entry.remote_port_stop = ntohs(port);
     if (vac->send(vac, (char *)mp, sizeof(*mp), &out, &out_len))
     {
         DBG1(DBG_KNL, "vac %s SPD entry failed", add ? "adding" : "removing");
@@ -532,7 +535,7 @@ static int bypass_port(bool add, uint32_t spd_id, uint16_t port)
         DBG1(DBG_KNL, "%s SPD entry failed rv:%d", add ? "add" : "remove", ntohl(rmp->retval));
         goto error;
     }
-    mp->is_outbound = 1;
+    mp->entry.is_outbound = 1;
     if (vac->send(vac, (char *)mp, sizeof(*mp), &out, &out_len))
     {
         DBG1(DBG_KNL, "vac %s SPD entry failed", add ? "adding" : "removing");
@@ -600,12 +603,13 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
     uint32_t priority, auto_priority;
     chunk_t src_from, src_to, dst_from, dst_to;
     host_t *src, *dst, *addr;
-    vl_api_ipsec_spd_add_del_entry_t *mp;
-    vl_api_ipsec_spd_add_del_entry_reply_t *rmp;
+    vl_api_ipsec_spd_entry_add_del_t *mp;
+    vl_api_ipsec_spd_entry_add_del_reply_t *rmp;
 
     mp = vl_msg_api_alloc (sizeof (*mp));
     memset(mp, 0, sizeof(*mp));
-
+	
+	
     this->mutex->lock(this->mutex);
     if (!id->interface)
     {
@@ -617,6 +621,9 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
         }
         id->interface = interface;
     }
+
+    DBG2(DBG_KNL, "manage policy [%s] interface [%s]", add?"ADD":"DEL", id->interface);
+
     spd = this->spds->get(this->spds, id->interface);
     if (!spd)
     {
@@ -626,6 +633,7 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
             goto error;
         }
         sw_if_index = get_sw_if_index(id->interface);
+    	DBG1(DBG_KNL, "SPD for %s found sw_if_index is %d", id->interface, sw_if_index);
         if (sw_if_index == ~0)
         {
             DBG1(DBG_KNL, "sw_if_index for %s not found", id->interface);
@@ -655,21 +663,21 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
     auto_priority = calculate_priority(data->prio, id->src_ts, id->dst_ts);
     priority = data->manual_prio ? data->manual_prio : auto_priority;
 
-    mp->_vl_msg_id = ntohs(VL_API_IPSEC_SPD_ADD_DEL_ENTRY);
+    mp->_vl_msg_id = ntohs(VL_API_IPSEC_SPD_ENTRY_ADD_DEL);
     mp->is_add = add;
-    mp->spd_id = ntohl(spd->spd_id);
-    mp->priority = ntohl(INT_MAX - priority);
-    mp->is_outbound = id->dir == POLICY_OUT;
+    mp->entry.spd_id = ntohl(spd->spd_id);
+    mp->entry.priority = ntohl(INT_MAX - priority);
+    mp->entry.is_outbound = id->dir == POLICY_OUT;
     switch (data->type)
     {
         case POLICY_IPSEC:
-            mp->policy = 3;
+            mp->entry.policy = ntohl(IPSEC_API_SPD_ACTION_PROTECT);
             break;
         case POLICY_PASS:
-            mp->policy = 0;
+            mp->entry.policy = ntohl(IPSEC_API_SPD_ACTION_BYPASS);
             break;
         case POLICY_DROP:
-            mp->policy = 1;
+            mp->entry.policy = ntohl(IPSEC_API_SPD_ACTION_DISCARD);
             break;
     }
     if ((data->type == POLICY_IPSEC) && data->sa)
@@ -686,46 +694,51 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
             DBG1(DBG_KNL, "SA ID not found");
             goto error;
         }
-        mp->sa_id = ntohl(*sad_id);
+        mp->entry.sa_id = ntohl(*sad_id);
     }
-
-    mp->is_ipv6 = id->src_ts->get_type(id->src_ts) == TS_IPV6_ADDR_RANGE;
-    mp->protocol = id->src_ts->get_protocol(id->src_ts);
+	
+	bool is_ipv6 = false;
+	if (id->src_ts->get_type(id->src_ts) == TS_IPV6_ADDR_RANGE)
+	{
+		is_ipv6 = true;
+		mp->entry.local_address_start.af 	= ntohl(ADDRESS_IP6);
+		mp->entry.local_address_stop.af		= ntohl(ADDRESS_IP6);
+		mp->entry.remote_address_start.af	= ntohl(ADDRESS_IP6);
+		mp->entry.remote_address_stop.af	= ntohl(ADDRESS_IP6);
+	}
+    mp->entry.protocol = id->src_ts->get_protocol(id->src_ts);
 
     if (id->dir == POLICY_OUT)
     {
         src_from = id->src_ts->get_from_address(id->src_ts);
         src_to = id->src_ts->get_to_address(id->src_ts);
-        src = host_create_from_chunk(mp->is_ipv6 ? AF_INET6 : AF_INET, src_to, 0);
+        src = host_create_from_chunk(is_ipv6 ? AF_INET6 : AF_INET, src_to, 0);
         dst_from = id->dst_ts->get_from_address(id->dst_ts);
         dst_to = id->dst_ts->get_to_address(id->dst_ts);
-        dst = host_create_from_chunk(mp->is_ipv6 ? AF_INET6 : AF_INET, dst_to, 0);
+        dst = host_create_from_chunk(is_ipv6 ? AF_INET6 : AF_INET, dst_to, 0);
     }
     else
     {
         dst_from = id->src_ts->get_from_address(id->src_ts);
         dst_to = id->src_ts->get_to_address(id->src_ts);
-        dst = host_create_from_chunk(mp->is_ipv6 ? AF_INET6 : AF_INET, src_to, 0);
+        dst = host_create_from_chunk(is_ipv6 ? AF_INET6 : AF_INET, src_to, 0);
         src_from = id->dst_ts->get_from_address(id->dst_ts);
         src_to = id->dst_ts->get_to_address(id->dst_ts);
-        src = host_create_from_chunk(mp->is_ipv6 ? AF_INET6 : AF_INET, dst_to, 0);
+        src = host_create_from_chunk(is_ipv6 ? AF_INET6 : AF_INET, dst_to, 0);
     }
 
     if (src->is_anyaddr(src) && dst->is_anyaddr(dst))
-    {
-        mp->is_ip_any = 1;
+	{
+	} else {
+        memcpy(is_ipv6?mp->entry.local_address_start.un.ip6:mp->entry.local_address_start.un.ip4, src_from.ptr, src_from.len);
+        memcpy(is_ipv6?mp->entry.local_address_stop.un.ip6:mp->entry.local_address_stop.un.ip4, src_to.ptr, src_to.len);
+        memcpy(is_ipv6?mp->entry.remote_address_start.un.ip6:mp->entry.remote_address_start.un.ip4, dst_from.ptr, dst_from.len);
+        memcpy(is_ipv6?mp->entry.remote_address_stop.un.ip6:mp->entry.remote_address_stop.un.ip4, dst_to.ptr, dst_to.len);
     }
-    else
-    {
-        memcpy(mp->local_address_start, src_from.ptr, src_from.len);
-        memcpy(mp->local_address_stop, src_to.ptr, src_to.len);
-        memcpy(mp->remote_address_start, dst_from.ptr, dst_from.len);
-        memcpy(mp->remote_address_stop, dst_to.ptr, dst_to.len);
-    }
-    mp->local_port_start = ntohs(id->src_ts->get_from_port(id->src_ts));
-    mp->local_port_stop = ntohs(id->src_ts->get_to_port(id->src_ts));
-    mp->remote_port_start = ntohs(id->dst_ts->get_from_port(id->dst_ts));
-    mp->remote_port_stop = ntohs(id->dst_ts->get_to_port(id->dst_ts));
+    mp->entry.local_port_start = ntohs(id->src_ts->get_from_port(id->src_ts));
+    mp->entry.local_port_stop = ntohs(id->src_ts->get_to_port(id->src_ts));
+    mp->entry.remote_port_start = ntohs(id->dst_ts->get_from_port(id->dst_ts));
+    mp->entry.remote_port_stop = ntohs(id->dst_ts->get_to_port(id->dst_ts));
 
     if (vac->send(vac, (char *)mp, sizeof(*mp), &out, &out_len))
     {
@@ -752,7 +765,7 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
             this->spds->remove(this->spds, id->interface);
         }
     }
-    if (this->install_routes && id->dir == POLICY_OUT && !mp->protocol)
+    if (this->install_routes && id->dir == POLICY_OUT && !mp->entry.protocol)
     {
         if (data->type == POLICY_IPSEC && data->sa->mode != MODE_TRANSPORT)
         {
@@ -796,8 +809,8 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
 {
     char *out = NULL;
     int out_len;
-    vl_api_ipsec_sad_add_del_entry_t *mp;
-    vl_api_ipsec_sad_add_del_entry_reply_t *rmp;
+    vl_api_ipsec_sad_entry_add_del_t *mp;
+    vl_api_ipsec_sad_entry_add_del_reply_t *rmp;
     uint32_t sad_id = ref_get(&this->next_sad_id);
     uint8_t ca = 0, ia = 0;
     status_t rv = FAILED;
@@ -816,27 +829,27 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
 
     mp = vl_msg_api_alloc(sizeof(*mp));
     memset(mp, 0, sizeof(*mp));
-    mp->_vl_msg_id = ntohs(VL_API_IPSEC_SAD_ADD_DEL_ENTRY);
+    mp->_vl_msg_id = ntohs(VL_API_IPSEC_SAD_ENTRY_ADD_DEL);
     mp->is_add = 1;
-    mp->sad_id = ntohl(sad_id);
-    mp->spi = id->spi;
-    mp->protocol = id->proto == IPPROTO_ESP;
+    mp->entry.sad_id = ntohl(sad_id);
+    mp->entry.spi = ntohl(id->spi);
+    mp->entry.protocol = id->proto == IPPROTO_ESP?ntohl(IPSEC_API_PROTO_ESP):ntohl(IPSEC_API_PROTO_AH);
     switch (data->enc_alg)
     {
         case ENCR_NULL:
-            ca = IPSEC_CRYPTO_ALG_NONE;
+            ca = IPSEC_API_CRYPTO_ALG_NONE;
             break;
         case ENCR_AES_CBC:
             switch (key_len * 8)
             {
                 case 128:
-                    ca = IPSEC_CRYPTO_ALG_AES_CBC_128;
+                    ca = IPSEC_API_CRYPTO_ALG_AES_CBC_128;
                     break;
                 case 192:
-                    ca = IPSEC_CRYPTO_ALG_AES_CBC_192;
+                    ca = IPSEC_API_CRYPTO_ALG_AES_CBC_192;
                     break;
                 case 256:
-                    ca = IPSEC_CRYPTO_ALG_AES_CBC_256;
+                    ca = IPSEC_API_CRYPTO_ALG_AES_CBC_256;
                     break;
                 default:
                     DBG1(DBG_KNL, "Key length %d is not supported by VPP!", key_len * 8);
@@ -847,13 +860,13 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
             switch (key_len * 8)
             {
                 case 128:
-                    ca = IPSEC_CRYPTO_ALG_AES_CTR_128;
+                    ca = IPSEC_API_CRYPTO_ALG_AES_CTR_128;
                     break;
                 case 192:
-                    ca = IPSEC_CRYPTO_ALG_AES_CTR_192;
+                    ca = IPSEC_API_CRYPTO_ALG_AES_CTR_192;
                     break;
                 case 256:
-                    ca = IPSEC_CRYPTO_ALG_AES_CTR_256;
+                    ca = IPSEC_API_CRYPTO_ALG_AES_CTR_256;
                     break;
                 default:
                     DBG1(DBG_KNL, "Key length %d is not supported by VPP!", key_len * 8);
@@ -867,13 +880,13 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
             switch (key_len * 8)
             {
                 case 128:
-                    ca = IPSEC_CRYPTO_ALG_AES_GCM_128;
+                    ca = IPSEC_API_CRYPTO_ALG_AES_GCM_128;
                     break;
                 case 192:
-                    ca = IPSEC_CRYPTO_ALG_AES_GCM_192;
+                    ca = IPSEC_API_CRYPTO_ALG_AES_GCM_192;
                     break;
                 case 256:
-                    ca = IPSEC_CRYPTO_ALG_AES_GCM_256;
+                    ca = IPSEC_API_CRYPTO_ALG_AES_GCM_256;
                     break;
                 default:
                     DBG1(DBG_KNL, "Key length %d is not supported by VPP!", key_len * 8);
@@ -882,10 +895,10 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
             }
             break;
         case ENCR_DES:
-            ca = IPSEC_CRYPTO_ALG_DES_CBC;
+            ca = IPSEC_API_CRYPTO_ALG_DES_CBC;
             break;
         case ENCR_3DES:
-            ca = IPSEC_CRYPTO_ALG_3DES_CBC;
+            ca = IPSEC_API_CRYPTO_ALG_3DES_CBC;
             break;
         default:
             DBG1(DBG_KNL, "algorithm %N not supported by VPP!",
@@ -893,32 +906,32 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
             goto error;
             break;
     }
-    mp->crypto_algorithm = ca;
-    mp->crypto_key_length = data->enc_key.len;
-    memcpy(mp->crypto_key, data->enc_key.ptr, data->enc_key.len);
+    mp->entry.crypto_algorithm = ntohl(ca);
+    mp->entry.crypto_key.length = data->enc_key.len<128?data->enc_key.len:128;
+    memcpy(mp->entry.crypto_key.data, data->enc_key.ptr, mp->entry.crypto_key.length);
 
     switch (data->int_alg)
     {
         case AUTH_UNDEFINED:
-            ia = IPSEC_INTEG_ALG_NONE;
+            ia = IPSEC_API_INTEG_ALG_NONE;
             break;
         case AUTH_HMAC_MD5_96:
-            ia = IPSEC_INTEG_ALG_MD5_96;
+            ia = IPSEC_API_INTEG_ALG_MD5_96;
             break;
         case AUTH_HMAC_SHA1_96:
-            ia = IPSEC_INTEG_ALG_SHA1_96;
+            ia = IPSEC_API_INTEG_ALG_SHA1_96;
             break;
         case AUTH_HMAC_SHA2_256_96:
-            ia = IPSEC_INTEG_ALG_SHA_256_96;
+            ia = IPSEC_API_INTEG_ALG_SHA_256_96;
             break;
         case AUTH_HMAC_SHA2_256_128:
-            ia = IPSEC_INTEG_ALG_SHA_256_128;
+            ia = IPSEC_API_INTEG_ALG_SHA_256_128;
             break;
         case AUTH_HMAC_SHA2_384_192:
-            ia = IPSEC_INTEG_ALG_SHA_384_192;
+            ia = IPSEC_API_INTEG_ALG_SHA_384_192;
             break;
         case AUTH_HMAC_SHA2_512_256:
-            ia = IPSEC_INTEG_ALG_SHA_512_256;
+            ia = IPSEC_API_INTEG_ALG_SHA_512_256;
             break;
         default:
             DBG1(DBG_KNL, "algorithm %N not supported by VPP!",
@@ -926,20 +939,32 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
             goto error;
             break;
     }
-    mp->integrity_algorithm = ia;
-    mp->integrity_key_length = data->int_key.len;
-    memcpy(mp->integrity_key, data->int_key.ptr, data->int_key.len);
-
-    mp->use_extended_sequence_number = data->esn;
-    if (data->mode == MODE_TUNNEL)
-    {
-        mp->is_tunnel = 1;
-        mp->is_tunnel_ipv6 = id->src->get_family(id->src) == AF_INET6;
+    mp->entry.integrity_algorithm = ntohl(ia);
+    mp->entry.integrity_key.length = data->int_key.len<128?data->int_key.len:128;
+    memcpy(mp->entry.integrity_key.data, data->int_key.ptr, mp->entry.integrity_key.length);
+	
+	int flags = IPSEC_API_CRYPTO_ALG_NONE;
+	if (data->esn)
+		flags |= IPSEC_API_SAD_FLAG_USE_ESN;
+    if (data->mode == MODE_TUNNEL) {
+		if (id->src->get_family(id->src) == AF_INET6)
+			flags |= IPSEC_API_SAD_FLAG_IS_TUNNEL_V6;
+		else 
+			flags |= IPSEC_API_SAD_FLAG_IS_TUNNEL;
     }
+	mp->entry.flags = ntohl(flags);
+
+	bool is_ipv6 = false;
+	if (id->src->get_family(id->src) == AF_INET6)
+	{
+		is_ipv6 = true;
+		mp->entry.tunnel_src.af = ntohl(ADDRESS_IP6);
+		mp->entry.tunnel_dst.af = ntohl(ADDRESS_IP6);
+	}
     src = id->src->get_address(id->src);
-    memcpy(mp->tunnel_src_address, src.ptr, src.len);
+    memcpy(is_ipv6?mp->entry.tunnel_src.un.ip6:mp->entry.tunnel_src.un.ip4, src.ptr, src.len);
     dst = id->dst->get_address(id->dst);
-    memcpy(mp->tunnel_dst_address, dst.ptr, dst.len);
+    memcpy(is_ipv6?mp->entry.tunnel_dst.un.ip6:mp->entry.tunnel_dst.un.ip4, dst.ptr, dst.len);
     if (vac->send(vac, (char *)mp, sizeof(*mp), &out, &out_len))
     {
         DBG1(DBG_KNL, "vac adding SA failed");
@@ -1003,7 +1028,7 @@ METHOD(kernel_ipsec_t, query_sa, status_t,
     memset(mp, 0, sizeof(*mp));
     mp->_vl_msg_id = ntohs(VL_API_IPSEC_SA_DUMP);
     mp->sa_id = ntohl(sa->sa_id);
-    if (vac->send_dump(vac, (char *)mp, sizeof(*mp), &out, &out_len))
+    if (vac->send(vac, (char *)mp, sizeof(*mp), &out, &out_len))
     {
         DBG1(DBG_KNL, "vac SA dump failed");
         goto error;
@@ -1041,8 +1066,8 @@ METHOD(kernel_ipsec_t, del_sa, status_t,
 {
     char *out = NULL;
     int out_len;
-    vl_api_ipsec_sad_add_del_entry_t *mp;
-    vl_api_ipsec_sad_add_del_entry_reply_t *rmp;
+    vl_api_ipsec_sad_entry_add_del_t *mp;
+    vl_api_ipsec_sad_entry_add_del_reply_t *rmp;
     status_t rv = FAILED;
     sa_t *sa;
 
@@ -1084,7 +1109,7 @@ METHOD(kernel_ipsec_t, flush_sas, status_t,
     enumerator_t *enumerator;
     int out_len;
     char *out;
-    vl_api_ipsec_sad_add_del_entry_t *mp;
+    vl_api_ipsec_sad_entry_add_del_t *mp;
     sa_t *sa = NULL;
 
     this->mutex->lock(this->mutex);

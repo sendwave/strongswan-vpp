@@ -139,11 +139,11 @@ static status_t manage_route(private_kernel_vpp_net_t *this, bool add,
     int out_len;
     enumerator_t *enumerator;
     iface_t *entry;
-    vl_api_ip_add_del_route_t *mp;
-    vl_api_ip_add_del_route_reply_t *rmp;
+    vl_api_ip_route_add_del_t *mp;
+    vl_api_ip_route_add_del_reply_t *rmp;
     bool exists = FALSE;
 
-    this->mutex->lock(this->mutex);
+	this->mutex->lock(this->mutex);
     enumerator = this->ifaces->create_enumerator(this->ifaces);
     while (enumerator->enumerate(enumerator, &entry))
     {
@@ -157,33 +157,48 @@ static status_t manage_route(private_kernel_vpp_net_t *this, bool add,
     this->mutex->unlock(this->mutex);
 
     if (!exists)
+	{
+		DBG1(DBG_NET, "if_name %s not found", name);
         return NOT_FOUND;
+	}
 
-    mp = vl_msg_api_alloc(sizeof(*mp));
-    memset(mp, 0, sizeof(*mp));
-    mp->_vl_msg_id = ntohs(VL_API_IP_ADD_DEL_ROUTE);
+	DBG2(DBG_NET, "****************manage_route : %s if_name %s [%d] prefixlen %d gtw %H", 
+		add?"ADD":"DEL", name, entry->index, prefixlen, gtw);
+
+    mp = vl_msg_api_alloc(sizeof(*mp) + sizeof(vl_api_fib_path_t));
+    memset(mp, 0, sizeof(*mp)+sizeof(vl_api_fib_path_t));
+    mp->_vl_msg_id = ntohs(VL_API_IP_ROUTE_ADD_DEL);
     mp->is_add = add;
-    mp->next_hop_sw_if_index = ntohl(entry->index);
-    mp->dst_address_length = prefixlen;
+	mp->route.n_paths = 1;
+	mp->route.paths[0].sw_if_index = ntohl(entry->index);
+	mp->route.prefix.len = prefixlen;
     switch (dst.len)
     {
         case 4:
-            mp->is_ipv6 = 0;
-            memcpy(mp->dst_address, dst.ptr, dst.len);
+			mp->route.prefix.address.af = ntohl(ADDRESS_IP4);
+			memcpy(mp->route.prefix.address.un.ip4, dst.ptr, dst.len);
+			if (gtw)
+    		{
+        		chunk_t addr = gtw->get_address(gtw);
+				mp->route.paths[0].proto = ntohl(FIB_API_PATH_NH_PROTO_IP4);
+				memcpy(mp->route.paths[0].nh.address.ip4, addr.ptr, addr.len);
+    		}
             break;
         case 16:
-            mp->is_ipv6 = 1;
-            memcpy(mp->dst_address, dst.ptr, dst.len);
+			mp->route.prefix.address.af = ntohl(ADDRESS_IP6);
+			memcpy(mp->route.prefix.address.un.ip6, dst.ptr, dst.len);
+			if (gtw)
+    		{
+        		chunk_t addr = gtw->get_address(gtw);
+				mp->route.paths[0].proto = ntohl(FIB_API_PATH_NH_PROTO_IP6);
+				memcpy(mp->route.paths[0].nh.address.ip6, addr.ptr, addr.len);
+    		}
             break;
         default:
             vl_msg_api_free(mp);
             return FAILED;
     }
-    if (gtw)
-    {
-        chunk_t addr = gtw->get_address(gtw);
-        memcpy(mp->next_hop_address, addr.ptr, addr.len);
-    }
+
     if (vac->send(vac, (char *)mp, sizeof(*mp), &out, &out_len))
     {
         DBG1(DBG_KNL, "vac %sing route failed", add ? "add" : "remov");
@@ -240,6 +255,33 @@ static bool addr_in_subnet(chunk_t addr, int prefix, chunk_t net, int net_len)
     return TRUE;
 }
 
+static void get_vpp_ip_table(bool is_ip6, int *tab_id, char *tab_name)
+{
+	char *out;
+	int out_len, num, i;
+	vl_api_ip_table_dump_t *mp;
+	vl_api_ip_table_details_t *rmp;
+
+	mp = vl_msg_api_alloc(sizeof(*mp));
+	clib_memset(mp, 0, sizeof(*mp));
+	mp->_vl_msg_id = ntohs(VL_API_IP_TABLE_DUMP);
+	
+	if(vac->send(vac, (char *)mp, sizeof(*mp), &out, &out_len)) {
+		vl_msg_api_free(mp);
+		return;
+	}
+	vl_msg_api_free(mp);
+	num = out_len/sizeof(*rmp);
+	DBG2(DBG_KNL, "out_len is %d num is %d sizeof(*rmp) %d", out_len, num, sizeof(*rmp));
+	rmp = (vl_api_ip_table_details_t *)out;
+	for(i = 0; i < num; i++) {
+		if (i) rmp += 1;
+		strncpy(tab_name, rmp->table.name, 64);
+		*tab_id = rmp->table.table_id;
+		DBG2(DBG_KNL, "%d: table_id is %d is_ip6 %d name is %s", i, ntohl(rmp->table.table_id), rmp->table.is_ip6, tab_name);
+	}
+}
+
 /**
  * Get a route: If "nexthop" the nexthop is returned, source addr otherwise
  */
@@ -259,31 +301,40 @@ static host_t *get_route(private_kernel_vpp_net_t *this, host_t *dest,
     path.preference = ~0;
     path.next_hop = chunk_empty;
 
+	vl_api_ip_route_dump_t *mp;
+	vl_api_ip_route_details_t *rmp;
+
+	mp = vl_msg_api_alloc(sizeof(*mp));
+	clib_memset(mp, 0, sizeof(*mp));
+	mp->_vl_msg_id = ntohs(VL_API_IP_ROUTE_DUMP);
+	mp->table.is_ip6 = dest->get_family(dest)==AF_INET6?1:0;
+	if (vac->send(vac, (char *)mp, sizeof(*mp), &out, &out_len)) 
+	{
+		vl_msg_api_free(mp);
+		DBG2(DBG_KNL, "send VL_API_IP_ROUTE_ADD_DEL failed");
+		return NULL;
+	}
+	vl_msg_api_free(mp);
+	
     if (dest->get_family(dest) == AF_INET)
     {
-        vl_api_ip_fib_dump_t *mp;
-        vl_api_ip_fib_details_t *rmp;
-
+		i = 0;
         family = AF_INET;
         if (prefix == -1)
             prefix = 32;
 
-        mp = vl_msg_api_alloc(sizeof(*mp));
-        mp->_vl_msg_id = ntohs(VL_API_IP_FIB_DUMP);
-        if (vac->send_dump(vac, (char *)mp, sizeof(*mp), &out, &out_len))
-            return NULL;
-        vl_msg_api_free(mp);
         tmp = out;
         while (tmp < (out + out_len))
         {
             rmp = (void *)tmp;
-            num = ntohl(rmp->count);
-            if (addr_in_subnet(dest->get_address(dest), prefix, chunk_create(rmp->address, 4), rmp->address_length))
+            num = rmp->route.n_paths;
+			DBG4(DBG_KNL, "index [%d] n_paths is %d prefix len is %d", i++, num, rmp->route.prefix.len);
+            if (addr_in_subnet(dest->get_address(dest), prefix, chunk_create(rmp->route.prefix.address.un.ip4, 4), rmp->route.prefix.len))
             {
-                fp = rmp->path;
+                fp = rmp->route.paths;
                 for (i = 0; i < num; i++)
                 {
-                    if (fp->is_drop)
+                    if (fp->type == FIB_API_PATH_TYPE_DROP)
                     {
                         fp++;
                         continue;
@@ -293,7 +344,7 @@ static host_t *get_route(private_kernel_vpp_net_t *this, host_t *dest,
                         path.sw_if_index = ntohl(fp->sw_if_index);
                         path.preference = fp->preference;
                         chunk_clear(&path.next_hop);
-                        path.next_hop = chunk_create(fp->next_hop, 4);
+                        path.next_hop = chunk_create(fp->nh.address.ip4, 4);
                     }
                     fp++;
                 }
@@ -303,8 +354,10 @@ static host_t *get_route(private_kernel_vpp_net_t *this, host_t *dest,
     }
     else
     {
-        vl_api_ip6_fib_dump_t *mp;
-        vl_api_ip6_fib_details_t *rmp;
+		DBG1(DBG_KNL, "not yet support ip6");
+#if	0
+        vl_api_ip6_route_dump_t *mp;
+        vl_api_ip6_route_details_t *rmp;
 
         family = AF_INET6;
         if (prefix == -1)
@@ -342,6 +395,7 @@ static host_t *get_route(private_kernel_vpp_net_t *this, host_t *dest,
             }
             tmp += sizeof(*rmp) + (sizeof(*fp) * num);
         }
+#endif
     }
 
     if (path.next_hop.len)
@@ -490,14 +544,14 @@ METHOD(kernel_net_t, add_route, status_t,
     private_kernel_vpp_net_t *this, chunk_t dst_net, u_int8_t prefixlen,
     host_t *gateway, host_t *src_ip, char *if_name)
 {
-    return manage_route(this, TRUE, dst_net, prefixlen, gateway, if_name);
+    return manage_route(this, TRUE, dst_net, prefixlen, NULL, if_name);
 }
 
 METHOD(kernel_net_t, del_route, status_t,
     private_kernel_vpp_net_t *this, chunk_t dst_net, u_int8_t prefixlen,
     host_t *gateway, host_t *src_ip, char *if_name)
 {
-    return manage_route(this, FALSE, dst_net, prefixlen, gateway, if_name);
+    return manage_route(this, FALSE, dst_net, prefixlen, NULL, if_name);
 }
 
 static void iface_destroy(iface_t *this)
@@ -528,34 +582,40 @@ static void update_addrs(private_kernel_vpp_net_t *this, iface_t *entry)
     host_t *host;
 
     mp = vl_msg_api_alloc(sizeof(*mp));
+	clib_memset(mp, 0, sizeof(*mp));
     mp->_vl_msg_id = ntohs(VL_API_IP_ADDRESS_DUMP);
     mp->sw_if_index = ntohl(entry->index);
     mp->is_ipv6 = 0;
     if (vac->send_dump(vac, (char *)mp, sizeof(*mp), &out, &out_len))
+	{
+		DBG2(DBG_NET, "update_addrs : send VL_API_IP_ADDRESS_DUMP ipv4 failed");
+		vl_msg_api_free(mp);
         return;
+	}
     num = out_len / sizeof(*rmp);
     addrs = linked_list_create();
     for (i = 0; i < num; i++)
     {
         rmp = (void *)out;
         out += sizeof(*rmp);
-        host = host_create_from_chunk(AF_INET, chunk_create(rmp->ip, 4), 0);
+        host = host_create_from_chunk(AF_INET, chunk_create(rmp->prefix.address.un.ip4, 4), 0);
         addrs->insert_last(addrs, host);
     }
-    vl_msg_api_free(mp);
     free(out);
-    mp = vl_msg_api_alloc(sizeof(*mp));
-    mp->_vl_msg_id = ntohs(VL_API_IP_ADDRESS_DUMP);
-    mp->sw_if_index = ntohl(entry->index);
+
     mp->is_ipv6 = 1;
     if (vac->send_dump(vac, (char *)mp, sizeof(*mp), &out, &out_len))
+	{	
+		DBG2(DBG_NET, "update_addrs : send VL_API_IP_ADDRESS_DUMP ipv6 failed");
+		vl_msg_api_free(mp);
         return;
+	}
     num = out_len / sizeof(*rmp);
     for (i = 0; i < num; i++)
     {
         rmp = (void *)out;
         out += sizeof(*rmp);
-        host = host_create_from_chunk(AF_INET6, chunk_create(rmp->ip, 16), 0);
+        host = host_create_from_chunk(AF_INET6, chunk_create(rmp->prefix.address.un.ip6, 16), 0);
         addrs->insert_last(addrs, host);
     }
     vl_msg_api_free(mp);
@@ -577,7 +637,7 @@ static void event_cb(char *data, int data_len, void *ctx)
     enumerator_t *enumerator;
 
     event = (void*)data;
-    DBG3(DBG_NET, "interface event %d", ntohl(event->sw_if_index));
+    DBG3(DBG_NET, "interface [%d] event %d", ntohl(event->sw_if_index), event->link_up_down);
     this->mutex->lock(this->mutex);
     enumerator = this->ifaces->create_enumerator(this->ifaces);
     while (enumerator->enumerate(enumerator, &entry))
@@ -591,9 +651,10 @@ static void event_cb(char *data, int data_len, void *ctx)
                      entry->index, entry->if_name);
                 iface_destroy(entry);
             }
-            else if (entry->up != event->admin_up_down)
+            else if (entry->up != event->link_up_down)
             {
-                entry->up = event->admin_up_down ? TRUE : FALSE;
+				// ??? some question
+                entry->up = event->link_up_down? TRUE : FALSE;
                 DBG2(DBG_NET, "interface state changed %u %s %s",
                      entry->index, entry->if_name, entry->up ? "UP" : "DOWN");
             }
@@ -617,24 +678,28 @@ static void *net_update_thread_fn(private_kernel_vpp_net_t *this)
         int out_len;
         vl_api_sw_interface_dump_t *mp;
         vl_api_sw_interface_details_t *rmp;
-        int i, num;
         enumerator_t *enumerator;
         iface_t *entry;
 
         mp = vl_msg_api_alloc (sizeof (*mp));
+		memset(mp, 0, sizeof(*mp));
         mp->_vl_msg_id = ntohs(VL_API_SW_INTERFACE_DUMP);
         mp->name_filter_valid = 0;
-        rv = vac->send_dump(vac, (char *)mp, sizeof(*mp), &out, &out_len);
+        rv = vac->send(vac, (u8 *)mp, sizeof(*mp), &out, &out_len);
         if (!rv)
         {
+			int i, num;
             this->mutex->lock(this->mutex);
             enumerator = this->ifaces->create_enumerator(this->ifaces);
-            num = out_len / sizeof(*rmp);
-            for (i = 0; i < num; i++)
+			num = out_len/sizeof(*rmp);
+			DBG4(DBG_KNL, "num is %d out_len is %d rmp is %d", num, out_len, sizeof(*rmp));
+            rmp = (vl_api_sw_interface_details_t *)out;
+			for (i = 0; i < num; i++)
             {
                  bool exists = FALSE;
-                 rmp = (void *)out;
-                 out += sizeof(*rmp);
+				 if (i) rmp += 1;
+				 DBG4(DBG_KNL, "[%d] _vl_msg_id is %d VL_API_SW_INTERFACE_DETAILS is %d  interface is %s sw_if_index is %d", 
+				 		i, ntohs(rmp->_vl_msg_id), VL_API_SW_INTERFACE_DETAILS, rmp->interface_name, ntohl(rmp->sw_if_index));
                  while (enumerator->enumerate(enumerator, &entry))
                  {
                      if (entry->index == ntohl(rmp->sw_if_index))
@@ -647,11 +712,11 @@ static void *net_update_thread_fn(private_kernel_vpp_net_t *this)
                  {
                      INIT(entry,
                              .index = ntohl(rmp->sw_if_index),
-                             .up = rmp->admin_up_down ? TRUE : FALSE,
+                             .up = rmp->link_up_down?TRUE:FALSE,
                              .addrs = linked_list_create(),
                      );
-                     strncpy(entry->if_name, rmp->interface_name, 64);
-                     DBG2(DBG_KNL, "IF %d %s %s", entry->index, entry->if_name, entry->up ? "UP" : "DOWN");
+                     memcpy(entry->if_name, rmp->interface_name, 63);
+                     DBG2(DBG_KNL, "IF %d %s  %s", entry->index, entry->if_name, entry->up ? "UP" : "DOWN");
                      this->ifaces->insert_last(this->ifaces, entry);
                  }
                  update_addrs(this, entry);
@@ -668,9 +733,10 @@ static void *net_update_thread_fn(private_kernel_vpp_net_t *this)
             api_main_t *am = &api_main;
 
             emp = vl_msg_api_alloc (sizeof (*emp));
+			clib_memset(emp, 0, sizeof(*emp));
             emp->_vl_msg_id = ntohs(VL_API_WANT_INTERFACE_EVENTS);
             emp->enable_disable = 1;
-            emp->pid = am->our_pid;
+            emp->pid = ntohl(am->our_pid);
             rv = vac->register_event(vac, (char *)emp, sizeof(*emp), event_cb,
                                      VL_API_SW_INTERFACE_EVENT, this);
             if (!rv)
@@ -678,7 +744,7 @@ static void *net_update_thread_fn(private_kernel_vpp_net_t *this)
 
         }
 
-        sleep(5);
+        sleep(10);
     }
     return NULL;
 }

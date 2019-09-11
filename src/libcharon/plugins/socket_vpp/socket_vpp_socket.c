@@ -24,15 +24,47 @@
 #include <threading/thread.h>
 #include <kernel_vpp_shared.h>
 #include <ip_packet.h>
+
+#include <vppinfra/clib.h>
+#include <vppinfra/vec.h>
+#include <vppinfra/hash.h>
+#include <vppinfra/bitmap.h>
+#include <vppinfra/fifo.h>
+#include <vppinfra/time.h>
+#include <vppinfra/mheap.h>
+#include <vppinfra/heap.h>
+#include <vppinfra/pool.h>
+#include <vppinfra/format.h>
+#include <vppinfra/error.h>
+
+#include <vnet/vnet.h>
+#include <vlib/vlib.h>
+#include <vlib/unix/unix.h>
 #include <vlibapi/api.h>
 #include <vlibmemory/api.h>
+#include <svm/svm.h>
+#include <svm/svmdb.h>
+
 #include <vpp/api/vpe_msg_enum.h>
 
-#define vl_typedefs
-#define vl_endianfun
+#include <vnet/ip/ip.h>
+
+#define f64_endian(a)
+#define f64_print(a,b)
+
+#define vl_typedefs		/* define message structures */
 #include <vpp/api/vpe_all_api_h.h>
 #undef vl_typedefs
+
+#define vl_endianfun		/* define message structures */
+#include <vpp/api/vpe_all_api_h.h>
 #undef vl_endianfun
+
+/* instantiate all the print functions we know about */
+#define vl_print(handle, ...)
+#define vl_printfun
+#include <vpp/api/vpe_all_api_h.h>
+#undef vl_printfun
 
 #define READ_PATH "/tmp/strongswan-uds-socket"
 
@@ -213,7 +245,7 @@ METHOD(socket_t, sender, status_t,
         src->set_port(src, this->port);
     }
 
-    DBG2(DBG_NET, "sending vpp packet: from %#H to %#H", src, dst);
+    DBG2(DBG_NET, "sending vpp packet: from %#H to %#H by sock %d", src, dst, this->sock);
 
     family = dst->get_family(dst);
 
@@ -289,23 +321,26 @@ static int register_punt_port(private_socket_vpp_socket_t *this, uint16_t port, 
     memset(mp, 0, sizeof(*mp));
     mp->_vl_msg_id = ntohs(VL_API_PUNT_SOCKET_REGISTER);
     mp->header_version = ntohl(1);
-    mp->is_ip4 = 1;
-    mp->l4_protocol = IPPROTO_UDP;
-    mp->l4_port = ntohs(port);
+	mp->punt.type = ntohl(PUNT_API_TYPE_L4);
+	mp->punt.punt.l4.af = ntohl(ADDRESS_IP4);
+	mp->punt.punt.l4.protocol = ntohl(IP_API_PROTO_UDP);
+	mp->punt.punt.l4.port = ntohs(port); 
     strncpy(mp->pathname, read_path, 107);
     if (this->vac->send(this->vac, (char*)mp, sizeof(*mp), &out, &out_len))
     {
         DBG1(DBG_LIB, "send register vpp ip4 punt socket fail on port %d", port);
         return -1;
     }
+
     rmp = (void *)out;
     if (rmp->retval)
     {
         DBG1(DBG_LIB, "register vpp ip4 punt socket fail on port %d with ret %d", port, ntohl(rmp->retval));
         return -1;
     }
+
     /* Register IPv6 punt socket for IKEv2 port in VPP */
-    mp->is_ip4=0;
+	mp->punt.punt.l4.af = ntohl(ADDRESS_IP6);
     if (this->vac->send(this->vac, (char*)mp, sizeof(*mp), &out, &out_len))
     {
         DBG1(DBG_LIB, "send register vpp ip6 punt socket fail on port %d", port);
@@ -317,7 +352,8 @@ static int register_punt_port(private_socket_vpp_socket_t *this, uint16_t port, 
         DBG1(DBG_LIB, "register vpp ip6 punt socket fail on port %d with ret %d", port, ntohl(rmp->retval));
         return -1;
     }
-    DBG3(DBG_LIB, "Registered vpp punt socket on port %d successfully with returned write path: %s", port, rmp->pathname);
+    
+	DBG2(DBG_LIB, "Registered vpp punt socket on port %d successfully with w:r path [%s:%s] %s", port, rmp->pathname, read_path);
 
     this->sock = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (this->sock < 0)
@@ -341,16 +377,14 @@ static int register_punt_port(private_socket_vpp_socket_t *this, uint16_t port, 
     return 0;
 }
 
+
 /*
  * See header for description
  */
 socket_vpp_socket_t *socket_vpp_socket_create()
 {
     private_socket_vpp_socket_t *this;
-    char *read_path, *out;
-    int out_len;
-    vl_api_punt_socket_register_t *mp;
-    vl_api_punt_socket_register_reply_t *rmp;
+    char *read_path;
 
     INIT(this,
         .public = {
@@ -379,6 +413,7 @@ socket_vpp_socket_t *socket_vpp_socket_create()
     read_path = lib->settings->get_str(lib->settings,
                             "%s.plugins.socket-vpp.path", READ_PATH, lib->ns);
     memset(&this->write_addr, 0, sizeof(this->write_addr));
+
 
     if (this->port && (register_punt_port(this, this->port, read_path) != 0))
     {
@@ -414,3 +449,4 @@ socket_vpp_socket_t *socket_vpp_socket_create()
     }
     return &this->public;
 }
+
