@@ -223,26 +223,31 @@ static void vac_api_handler (private_vac_t *this, void *msg)
 
     rmp = (void *)msg;
     seq = (uintptr_t)rmp->context;
+#if 0
     if (id == VL_API_IP_ADDRESS_DETAILS)
     {
+		DBG2(DBG_KNL, "vac_api_handler : it is VL_API_IP_ADDRESS_DETAILS %d", id);
         vl_api_ip_address_details_t *ip;
         ip = (void*)msg;
         seq = (uintptr_t)ip->context;
     }
-
+#endif
     //DBG4(DBG_KNL, "vac read msg ID %d len %d seq %u", id, l, seq);
 
     this->entries_lock->lock(this->entries_lock);
     entry = this->entries->get(this->entries, (void*)seq);
     if (entry)
     {
+        //DBG2(DBG_KNL, "received vac msg seq %u id %d len %d is_dump %d VL_API_MEMCLNT_KEEPALIVE_REPLY %d", 
+		//	seq, id, l, entry->is_dump, VL_API_CONTROL_PING_REPLY);
+#if	1
         if (entry->is_dump)
         {
             if (id == VL_API_CONTROL_PING_REPLY)
             {
                 entry->complete = TRUE;
                 entry->condvar->signal(entry->condvar);
-                //DBG4(DBG_KNL, "vac received control ping");
+                //DBG4(DBG_KNL, "vac received control ping %d", id);
                 vac_free(msg);
                 this->entries_lock->unlock(this->entries_lock);
                 return;
@@ -253,20 +258,27 @@ static void vac_api_handler (private_vac_t *this, void *msg)
             entry->complete = TRUE;
             entry->condvar->signal(entry->condvar);
         }
+#endif
         rmsg = malloc(l + sizeof(msgbuf_t));
         rmsg->data_len = l;
         memcpy(rmsg->data, msg, l);
         array_insert(entry->rmsgs, ARRAY_TAIL, rmsg);
+#if	0	
+		// debug here, still problem
+		entry->complete = TRUE;
+		entry->condvar->signal(entry->condvar);
+#endif
     }
     else
     {
+        DBG2(DBG_KNL, "received vac msg seq %u id %d len %d ", seq, id, l);
         this->events_lock->lock(this->events_lock);
         event_id = (uintptr_t)id;
         event = this->events->get(this->events, (void*)event_id);
         if (event)
             event->cb(msg, l, event->ctx);
         else
-            DBG1(DBG_KNL, "received unknown vac msg seq %u id %d, ignored", seq, id);
+            DBG1(DBG_KNL, "received unknown vac msg seq %u id %d len %d, ignored", seq, id, l);
         this->events_lock->unlock(this->events_lock);
     }
 
@@ -299,7 +311,7 @@ static void *vac_rx_thread_fn(private_vac_t *this)
                 this->queue_lock->lock(this->queue_lock);
                 this->terminate_cv->signal(this->terminate_cv);
                 this->queue_lock->unlock(this->queue_lock);
-                DBG3(DBG_KNL, "vac received rx thread exit");
+                DBG3(DBG_KNL, "vac received rx thread exit [%d]", VL_API_RX_THREAD_EXIT);
                 thread_exit(NULL);
                 return NULL;
                 break;
@@ -310,11 +322,11 @@ static void *vac_rx_thread_fn(private_vac_t *this)
                 this->suspend_cv->signal(this->suspend_cv);
                 this->resume_cv->wait(this->resume_cv, this->queue_lock);
                 this->queue_lock->unlock(this->queue_lock);
-                DBG3(DBG_KNL, "vac received rx thread suspend");
+                DBG3(DBG_KNL, "vac received rx thread suspend [%d]", VL_API_MEMCLNT_RX_THREAD_SUSPEND);
                 break;
 
             case VL_API_MEMCLNT_READ_TIMEOUT:
-                DBG3(DBG_KNL, "vac received read timeout");
+                DBG3(DBG_KNL, "vac received read timeout [%d]", VL_API_MEMCLNT_READ_TIMEOUT);
                 vl_msg_api_free((void *) msg);
                 break;
 
@@ -327,7 +339,7 @@ static void *vac_rx_thread_fn(private_vac_t *this)
                 shmem_hdr = am->shmem_hdr;
                 vl_msg_api_send_shmem(shmem_hdr->vl_input_queue, (u8 *)&rmp);
                 vl_msg_api_free((void *) msg);
-                DBG3(DBG_KNL, "vac received keepalive");
+                DBG3(DBG_KNL, "vac received keepalive %d", VL_API_MEMCLNT_KEEPALIVE);
                 break;
 
             default:
@@ -405,7 +417,7 @@ static status_t vac_write(private_vac_t *this, char *p, int l, uint32_t ctx)
         vac_free(mp);
         return FAILED;
     }
-    //DBG3(DBG_KNL, "vac write msg ID %d len %d", ntohs(mp->_vl_msg_id), l);
+    //DBG3(DBG_KNL, "client %d vac write msg ID %d len %d", am->my_client_index, ntohs(mp->_vl_msg_id), l);
 
     return SUCCESS;
 }
@@ -459,6 +471,7 @@ static status_t send_vac(private_vac_t *this, char *in, int in_len, char **out,
         vl_msg_api_free(mp);
         if (rv)
         {
+			DBG2(DBG_KNL, "vac_write VL_API_CONTROL_PING failed");
             destroy_entry(entry);
             this->entries_lock->unlock(this->entries_lock);
             return FAILED;

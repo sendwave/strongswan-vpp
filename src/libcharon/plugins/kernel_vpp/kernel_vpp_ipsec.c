@@ -126,7 +126,7 @@ typedef struct {
     /** Prefix length of dst_net */
     uint8_t prefixlen;
     /** References for route */
-    int refs;
+    refcount_t refs;
 } route_entry_t;
 
 #define htonll(x) ((1==htonl(1)) ? (x) : ((uint64_t)htonl((x) & 0xFFFFFFFF) << 32) | htonl((x) >> 32))
@@ -191,8 +191,8 @@ static void manage_route(private_kernel_vpp_ipsec_t *this, bool add,
     {
         if (route_exist)
         {
-			DBG2(DBG_KNL, "add route but it exist %d", route->refs);
-            route->refs++;
+			unsigned int refs_num = ref_get(&route->refs);
+			DBG2(DBG_KNL, "add route but it exist %d", refs_num);
         }
         else
         {
@@ -207,12 +207,12 @@ static void manage_route(private_kernel_vpp_ipsec_t *this, bool add,
             );
             this->routes->insert_last(this->routes, route);
             charon->kernel->add_route(charon->kernel,
-                 dst_net->get_address(dst_net), prefixlen, dst, gateway, if_name);
+                 dst_net->get_address(dst_net), prefixlen, gateway, dst, if_name);
         }
     }
     else
     {
-        if (!route_exist || --route->refs > 0)
+        if (!route_exist || ref_put(&route->refs) > 0)
         {
 			DBG2(DBG_KNL, "del route but it not exist or refs is %d", route->refs);
             return;
@@ -222,7 +222,7 @@ static void manage_route(private_kernel_vpp_ipsec_t *this, bool add,
         this->routes->remove(this->routes, route, NULL);
         route_destroy(route);
         charon->kernel->del_route(charon->kernel, dst_net->get_address(dst_net),
-             prefixlen, dst, gateway, if_name);
+             prefixlen, gateway, dst, if_name);
     }
 }
 
@@ -450,27 +450,30 @@ error:
     return rv;
 }
 
-static int bypass_port(bool add, uint32_t spd_id, uint16_t port)
+static int bypass_all(bool add, uint32_t spd_id)
 {
-    vl_api_ipsec_spd_entry_add_del_t *mp;
+	vl_api_ipsec_spd_entry_add_del_t *mp;
     vl_api_ipsec_spd_entry_add_del_reply_t *rmp;
     char *out = NULL;
     int out_len;
     status_t rv = FAILED;
 
-	DBG2(DBG_KNL, "bypass_port [%s] spd_id %d port %d", add?"ADD":"DEL", spd_id, port);
+	DBG2(DBG_KNL, "bypass_all [%s] spd_id %d", add?"ADD":"DEL", spd_id);
 
     mp = vl_msg_api_alloc (sizeof (*mp));
     memset(mp, 0, sizeof(*mp));
 
 	mp->_vl_msg_id = ntohs(VL_API_IPSEC_SPD_ENTRY_ADD_DEL);
 	mp->is_add = add;
+	mp->entry.sa_id = ~0; // liudf added for debug ???????
 	mp->entry.spd_id = ntohl(spd_id);
 	mp->entry.priority = ntohl(INT_MAX - POLICY_PRIORITY_PASS);
 	mp->entry.is_outbound = 0;
 	mp->entry.policy = ntohl(IPSEC_API_SPD_ACTION_BYPASS);
 	memset(mp->entry.local_address_stop.un.ip6, 0xFF, 16);
 	memset(mp->entry.remote_address_stop.un.ip6, 0xFF, 16);
+	mp->entry.remote_port_start = mp->entry.local_port_start = ntohs(0);
+	mp->entry.remote_port_stop = mp->entry.local_port_stop = ntohs(0xFFFF);
 	mp->entry.protocol = IP_API_PROTO_ESP;
     if (vac->send(vac, (char *)mp, sizeof(*mp), &out, &out_len))
     {
@@ -520,10 +523,43 @@ static int bypass_port(bool add, uint32_t spd_id, uint16_t port)
         DBG1(DBG_KNL, "%s SPD entry failed rv:%d", add ? "add" : "remove", ntohl(rmp->retval));
         goto error;
     }
+	
+	rv = SUCCESS;
+
+error:
+    if(out) free(out);
+    vl_msg_api_free(mp);
+
+    return rv;
+
+}
+
+static int bypass_port(bool add, uint32_t spd_id, uint16_t port)
+{
+    vl_api_ipsec_spd_entry_add_del_t *mp;
+    vl_api_ipsec_spd_entry_add_del_reply_t *rmp;
+    char *out = NULL;
+    int out_len;
+    status_t rv = FAILED;
+
+	DBG2(DBG_KNL, "bypass_port [%s] spd_id %d port %d", add?"ADD":"DEL", spd_id, port);
+
+    mp = vl_msg_api_alloc (sizeof (*mp));
+    memset(mp, 0, sizeof(*mp));
+
+	mp->_vl_msg_id = ntohs(VL_API_IPSEC_SPD_ENTRY_ADD_DEL);
+	mp->is_add = add;
+	mp->entry.sa_id = ~0; // liudf added for debug ???????
+	mp->entry.spd_id = ntohl(spd_id);
+	mp->entry.priority = ntohl(INT_MAX - POLICY_PRIORITY_PASS);
+	mp->entry.policy = ntohl(IPSEC_API_SPD_ACTION_BYPASS);
+	memset(mp->entry.local_address_stop.un.ip6, 0xFF, 16);
+	memset(mp->entry.remote_address_stop.un.ip6, 0xFF, 16);
     mp->entry.is_outbound = 0;
     mp->entry.protocol = IP_API_PROTO_UDP;
     mp->entry.local_port_start = mp->entry.local_port_stop = ntohs(port);
-    mp->entry.remote_port_start = mp->entry.remote_port_stop = ntohs(port);
+    mp->entry.remote_port_stop = ntohs(0);
+	mp->entry.remote_port_stop = ntohs(0xFFFF);
     if (vac->send(vac, (char *)mp, sizeof(*mp), &out, &out_len))
     {
         DBG1(DBG_KNL, "vac %s SPD entry failed", add ? "adding" : "removing");
@@ -550,7 +586,7 @@ static int bypass_port(bool add, uint32_t spd_id, uint16_t port)
     rv = SUCCESS;
 
 error:
-    free(out);
+    if (out) free(out);
     vl_msg_api_free(mp);
 
     return rv;
@@ -563,6 +599,8 @@ static status_t manage_bypass(bool add, uint32_t spd_id)
 {
     uint16_t port;
     status_t rv;
+
+	bypass_all(add, spd_id);
 
     port = lib->settings->get_int(lib->settings, "%s.port", IKEV2_UDP_PORT, lib->ns);
 
@@ -608,8 +646,7 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
 
     mp = vl_msg_api_alloc (sizeof (*mp));
     memset(mp, 0, sizeof(*mp));
-	
-	
+		
     this->mutex->lock(this->mutex);
     if (!id->interface)
     {
@@ -629,11 +666,11 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
     {
         if (!add)
         {
-            DBG1(DBG_KNL, "SPD for %s not found", id->interface);
+            DBG1(DBG_KNL, "SPD for %s not found, should not be deleted", id->interface);
             goto error;
         }
         sw_if_index = get_sw_if_index(id->interface);
-    	DBG1(DBG_KNL, "SPD for %s found sw_if_index is %d", id->interface, sw_if_index);
+    	DBG4(DBG_KNL, "firstly created, spd for %s found sw_if_index is %d", id->interface, sw_if_index);
         if (sw_if_index == ~0)
         {
             DBG1(DBG_KNL, "sw_if_index for %s not found", id->interface);
@@ -642,14 +679,17 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
         spd_id = ref_get(&this->next_spd_id);
         if (spd_add_del(TRUE, spd_id))
         {
+            DBG1(DBG_KNL, "spd_add_del %d failed!!!!!", spd_id);
             goto error;
         }
         if (manage_bypass(TRUE, spd_id))
         {
+            DBG1(DBG_KNL, "manage_bypass %d failed!!!!", spd_id);
             goto error;
         }
         if (interface_add_del_spd(TRUE, spd_id, sw_if_index))
         {
+            DBG1(DBG_KNL, "interface_add_del_spd  %d %d failed!!!!!", spd_id, sw_if_index);
             goto error;
         }
         INIT(spd,
@@ -705,7 +745,14 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
 		mp->entry.local_address_stop.af		= ntohl(ADDRESS_IP6);
 		mp->entry.remote_address_start.af	= ntohl(ADDRESS_IP6);
 		mp->entry.remote_address_stop.af	= ntohl(ADDRESS_IP6);
+	} else {
+		mp->entry.local_address_start.af 	= ntohl(ADDRESS_IP4);
+		mp->entry.local_address_stop.af		= ntohl(ADDRESS_IP4);
+		mp->entry.remote_address_start.af	= ntohl(ADDRESS_IP4);
+		mp->entry.remote_address_stop.af	= ntohl(ADDRESS_IP4);
+
 	}
+	// liudf added? no need to tranfer protocol?
     mp->entry.protocol = id->src_ts->get_protocol(id->src_ts);
 
     if (id->dir == POLICY_OUT)
@@ -729,6 +776,9 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
 
     if (src->is_anyaddr(src) && dst->is_anyaddr(dst))
 	{
+		// ??? 
+		memset(mp->entry.local_address_stop.un.ip6, 0xFF, 16);
+		memset(mp->entry.remote_address_stop.un.ip6, 0xFF, 16);
 	} else {
         memcpy(is_ipv6?mp->entry.local_address_start.un.ip6:mp->entry.local_address_start.un.ip4, src_from.ptr, src_from.len);
         memcpy(is_ipv6?mp->entry.local_address_stop.un.ip6:mp->entry.local_address_stop.un.ip4, src_to.ptr, src_to.len);
@@ -751,20 +801,21 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
         DBG1(DBG_KNL, "%s SPD entry failed rv:%d", add ? "add" : "remove", ntohl(rmp->retval));
         goto error;
     }
+
     if (add)
     {
         ref_get(&spd->policy_num);
-    }
-    else
-    {
+    } else {
         if (ref_put(&spd->policy_num))
         {
+        	DBG1(DBG_KNL, "policy_num's ref is 0, delete spd_id %d sw_if_index %d!!!!!!!!!!!!", spd->spd_id, spd->sw_if_index);
             interface_add_del_spd(FALSE, spd->spd_id, spd->sw_if_index);
             manage_bypass(FALSE, spd->spd_id);
             spd_add_del(FALSE, spd->spd_id);
             this->spds->remove(this->spds, id->interface);
         }
     }
+
     if (this->install_routes && id->dir == POLICY_OUT && !mp->entry.protocol)
     {
         if (data->type == POLICY_IPSEC && data->sa->mode != MODE_TRANSPORT)
@@ -800,6 +851,7 @@ METHOD(kernel_ipsec_t, get_cpi, status_t,
     private_kernel_vpp_ipsec_t *this, host_t *src, host_t *dst,
     uint16_t *cpi)
 {
+	DBG1(DBG_KNL, "get_cpi is not supported!!!!!!!!!!!!!!!!!!!!!!!!");
     return NOT_SUPPORTED;
 }
 
@@ -853,7 +905,7 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
                     break;
                 default:
                     DBG1(DBG_KNL, "Key length %d is not supported by VPP!", key_len * 8);
-                    break;
+					goto error;
             }
             break;
         case ENCR_AES_CTR:
@@ -871,7 +923,6 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
                 default:
                     DBG1(DBG_KNL, "Key length %d is not supported by VPP!", key_len * 8);
                     goto error;
-                    break;
             }
             break;
         case ENCR_AES_GCM_ICV8:
@@ -891,7 +942,6 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
                 default:
                     DBG1(DBG_KNL, "Key length %d is not supported by VPP!", key_len * 8);
                     goto error;
-                    break;
             }
             break;
         case ENCR_DES:
@@ -904,7 +954,6 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
             DBG1(DBG_KNL, "algorithm %N not supported by VPP!",
                  encryption_algorithm_names, data->enc_alg);
             goto error;
-            break;
     }
     mp->entry.crypto_algorithm = ntohl(ca);
     mp->entry.crypto_key.length = data->enc_key.len<128?data->enc_key.len:128;
@@ -943,15 +992,21 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
     mp->entry.integrity_key.length = data->int_key.len<128?data->int_key.len:128;
     memcpy(mp->entry.integrity_key.data, data->int_key.ptr, mp->entry.integrity_key.length);
 	
-	int flags = IPSEC_API_CRYPTO_ALG_NONE;
+	int flags = IPSEC_API_SAD_FLAG_NONE;
 	if (data->esn)
 		flags |= IPSEC_API_SAD_FLAG_USE_ESN;
-    if (data->mode == MODE_TUNNEL) {
+    if (data->mode == MODE_TUNNEL) 
+	{
 		if (id->src->get_family(id->src) == AF_INET6)
 			flags |= IPSEC_API_SAD_FLAG_IS_TUNNEL_V6;
 		else 
 			flags |= IPSEC_API_SAD_FLAG_IS_TUNNEL;
     }
+	if (data->encap) 
+	{
+        DBG1(DBG_KNL, "UDP encap!!!!!!!!!!!!!!!!!!!!");
+		flags |= IPSEC_API_SAD_FLAG_UDP_ENCAP;
+	}
 	mp->entry.flags = ntohl(flags);
 
 	bool is_ipv6 = false;
@@ -960,6 +1015,9 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
 		is_ipv6 = true;
 		mp->entry.tunnel_src.af = ntohl(ADDRESS_IP6);
 		mp->entry.tunnel_dst.af = ntohl(ADDRESS_IP6);
+	} else {
+		mp->entry.tunnel_src.af = ntohl(ADDRESS_IP4);
+		mp->entry.tunnel_dst.af = ntohl(ADDRESS_IP4);
 	}
     src = id->src->get_address(id->src);
     memcpy(is_ipv6?mp->entry.tunnel_src.un.ip6:mp->entry.tunnel_src.un.ip4, src.ptr, src.len);
@@ -1001,6 +1059,7 @@ METHOD(kernel_ipsec_t, update_sa, status_t,
     private_kernel_vpp_ipsec_t *this, kernel_ipsec_sa_id_t *id,
     kernel_ipsec_update_sa_t *data)
 {
+    DBG1(DBG_KNL, "update sa not supported!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
     return NOT_SUPPORTED;
 }
 
@@ -1120,7 +1179,8 @@ METHOD(kernel_ipsec_t, flush_sas, status_t,
         mp->is_add = 0;
         if (vac->send(vac, (char *)mp, sizeof(*mp), &out, &out_len))
         {
-            break;
+			DBG1(DBG_KNL, "flush_sas failed!!!!");
+            return FALSE;
         }
         free(out);
         vl_msg_api_free(mp);
@@ -1168,6 +1228,7 @@ METHOD(kernel_ipsec_t, bypass_socket, bool,
 METHOD(kernel_ipsec_t, enable_udp_decap, bool,
     private_kernel_vpp_ipsec_t *this, int fd, int family, u_int16_t port)
 {
+	DBG1(DBG_KNL, "enable_udp_decap not supported!!!!!!!!!!!!!!!!!!!!!!!!!");
     return FALSE;
 }
 
