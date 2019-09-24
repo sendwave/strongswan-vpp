@@ -450,7 +450,7 @@ error:
     return rv;
 }
 
-static int bypass_all(bool add, uint32_t spd_id)
+static int bypass_all(bool add, uint32_t spd_id, uint32_t sa_id)
 {
 	vl_api_ipsec_spd_entry_add_del_t *mp;
     vl_api_ipsec_spd_entry_add_del_reply_t *rmp;
@@ -458,14 +458,14 @@ static int bypass_all(bool add, uint32_t spd_id)
     int out_len;
     status_t rv = FAILED;
 
-	DBG2(DBG_KNL, "bypass_all [%s] spd_id %d", add?"ADD":"DEL", spd_id);
+	DBG2(DBG_KNL, "bypass_all [%s] spd_id %d sa_id %d", add?"ADD":"DEL", spd_id, sa_id);
 
     mp = vl_msg_api_alloc (sizeof (*mp));
     memset(mp, 0, sizeof(*mp));
 
 	mp->_vl_msg_id = ntohs(VL_API_IPSEC_SPD_ENTRY_ADD_DEL);
 	mp->is_add = add;
-	mp->entry.sa_id = ~0; // liudf added for debug ???????
+	mp->entry.sa_id = ntohl(sa_id);
 	mp->entry.spd_id = ntohl(spd_id);
 	mp->entry.priority = ntohl(INT_MAX - POLICY_PRIORITY_PASS);
 	mp->entry.is_outbound = 0;
@@ -534,7 +534,7 @@ error:
 
 }
 
-static int bypass_port(bool add, uint32_t spd_id, uint16_t port)
+static int bypass_port(bool add, uint32_t spd_id, uint32_t sa_id,  uint16_t port)
 {
     vl_api_ipsec_spd_entry_add_del_t *mp;
     vl_api_ipsec_spd_entry_add_del_reply_t *rmp;
@@ -542,14 +542,14 @@ static int bypass_port(bool add, uint32_t spd_id, uint16_t port)
     int out_len;
     status_t rv = FAILED;
 
-	DBG2(DBG_KNL, "bypass_port [%s] spd_id %d port %d", add?"ADD":"DEL", spd_id, port);
+	DBG2(DBG_KNL, "bypass_port [%s] spd_id %d port %d sa_id %d", add?"ADD":"DEL", spd_id, port, sa_id);
 
     mp = vl_msg_api_alloc (sizeof (*mp));
     memset(mp, 0, sizeof(*mp));
 
 	mp->_vl_msg_id = ntohs(VL_API_IPSEC_SPD_ENTRY_ADD_DEL);
 	mp->is_add = add;
-	mp->entry.sa_id = ~0; // liudf added for debug ???????
+	mp->entry.sa_id = ntohl(sa_id);
 	mp->entry.spd_id = ntohl(spd_id);
 	mp->entry.priority = ntohl(INT_MAX - POLICY_PRIORITY_PASS);
 	mp->entry.policy = ntohl(IPSEC_API_SPD_ACTION_BYPASS);
@@ -595,18 +595,18 @@ error:
 /**
  * Add or remove a bypass policy
  */
-static status_t manage_bypass(bool add, uint32_t spd_id)
+static status_t manage_bypass(bool add, uint32_t spd_id, uint32_t sa_id)
 {
     uint16_t port;
     status_t rv;
 
-	bypass_all(add, spd_id);
+	bypass_all(add, spd_id, sa_id);
 
     port = lib->settings->get_int(lib->settings, "%s.port", IKEV2_UDP_PORT, lib->ns);
 
     if (port)
     {
-        rv = bypass_port(add, spd_id, port);
+        rv = bypass_port(add, spd_id, sa_id, port);
         if (rv != SUCCESS)
         {
             return rv;
@@ -616,7 +616,7 @@ static status_t manage_bypass(bool add, uint32_t spd_id)
     port = lib->settings->get_int(lib->settings, "%s.port_nat_t", IKEV2_NATT_PORT, lib->ns);
     if (port)
     {
-        rv = bypass_port(add, spd_id, port);
+        rv = bypass_port(add, spd_id, sa_id, port);
         if (rv != SUCCESS)
         {
             return rv;
@@ -643,6 +643,7 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
     host_t *src, *dst, *addr;
     vl_api_ipsec_spd_entry_add_del_t *mp;
     vl_api_ipsec_spd_entry_add_del_reply_t *rmp;
+	bool n_spd = false;
 
     mp = vl_msg_api_alloc (sizeof (*mp));
     memset(mp, 0, sizeof(*mp));
@@ -682,11 +683,6 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
             DBG1(DBG_KNL, "spd_add_del %d failed!!!!!", spd_id);
             goto error;
         }
-        if (manage_bypass(TRUE, spd_id))
-        {
-            DBG1(DBG_KNL, "manage_bypass %d failed!!!!", spd_id);
-            goto error;
-        }
         if (interface_add_del_spd(TRUE, spd_id, sw_if_index))
         {
             DBG1(DBG_KNL, "interface_add_del_spd  %d %d failed!!!!!", spd_id, sw_if_index);
@@ -698,6 +694,7 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
                 .policy_num = 0,
         );
         this->spds->put(this->spds, id->interface, spd);
+		n_spd = true;
     }
 
     auto_priority = calculate_priority(data->prio, id->src_ts, id->dst_ts);
@@ -734,8 +731,17 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
             DBG1(DBG_KNL, "SA ID not found");
             goto error;
         }
-        mp->entry.sa_id = ntohl(*sad_id);
+
+		if (n_spd) {
+			if (manage_bypass(TRUE, spd_id, sad_id))
+        	{
+            	DBG1(DBG_KNL, "manage_bypass %d failed!!!!", spd_id);
+            	goto error;
+        	}
+		}
     }
+
+    mp->entry.sa_id = ntohl(*sad_id);
 	
 	bool is_ipv6 = false;
 	if (id->src_ts->get_type(id->src_ts) == TS_IPV6_ADDR_RANGE)
@@ -752,7 +758,6 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
 		mp->entry.remote_address_stop.af	= ntohl(ADDRESS_IP4);
 
 	}
-	// liudf added? no need to tranfer protocol?
     mp->entry.protocol = id->src_ts->get_protocol(id->src_ts);
 
     if (id->dir == POLICY_OUT)
@@ -808,9 +813,9 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
     } else {
         if (ref_put(&spd->policy_num))
         {
-        	DBG1(DBG_KNL, "policy_num's ref is 0, delete spd_id %d sw_if_index %d!!!!!!!!!!!!", spd->spd_id, spd->sw_if_index);
+        	DBG1(DBG_KNL, "policy_num's ref is 0, delete spd_id %d sw_if_index %d sad_id !!!!!!!!!!!!", spd->spd_id, spd->sw_if_index, sad_id);
             interface_add_del_spd(FALSE, spd->spd_id, spd->sw_if_index);
-            manage_bypass(FALSE, spd->spd_id);
+            manage_bypass(FALSE, spd->spd_id, sad_id);
             spd_add_del(FALSE, spd->spd_id);
             this->spds->remove(this->spds, id->interface);
         }
@@ -884,7 +889,8 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
     mp->_vl_msg_id = ntohs(VL_API_IPSEC_SAD_ENTRY_ADD_DEL);
     mp->is_add = 1;
     mp->entry.sad_id = ntohl(sad_id);
-    mp->entry.spi = ntohl(id->spi);
+    //mp->entry.spi = ntohl(id->spi);
+    mp->entry.spi = id->spi;
     mp->entry.protocol = id->proto == IPPROTO_ESP?ntohl(IPSEC_API_PROTO_ESP):ntohl(IPSEC_API_PROTO_AH);
     switch (data->enc_alg)
     {
