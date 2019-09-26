@@ -889,9 +889,10 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
     mp->_vl_msg_id = ntohs(VL_API_IPSEC_SAD_ENTRY_ADD_DEL);
     mp->is_add = 1;
     mp->entry.sad_id = ntohl(sad_id);
-    //mp->entry.spi = ntohl(id->spi);
-    mp->entry.spi = id->spi;
+    mp->entry.spi = id->spi; // attention!!! don't need to ntohl by liudf
     mp->entry.protocol = id->proto == IPPROTO_ESP?ntohl(IPSEC_API_PROTO_ESP):ntohl(IPSEC_API_PROTO_AH);
+	mp->entry.dst_port = ntohs(id->dst->get_port(id->dst));
+	mp->entry.src_port = ntohs(id->src->get_port(id->src));
     switch (data->enc_alg)
     {
         case ENCR_NULL:
