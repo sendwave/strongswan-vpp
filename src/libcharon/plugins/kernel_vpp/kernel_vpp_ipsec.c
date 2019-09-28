@@ -189,6 +189,8 @@ static void manage_route(private_kernel_vpp_ipsec_t *this, bool add,
         (void**)&route, if_name, gateway, dst_net, &prefixlen);
     if (add)
     {
+		DBG2(DBG_KNL, "installing route: %H/%d via %H dev %s",
+                 dst_net, prefixlen, gateway, if_name);
         if (route_exist)
         {
 			unsigned int refs_num = ref_get(&route->refs);
@@ -196,9 +198,7 @@ static void manage_route(private_kernel_vpp_ipsec_t *this, bool add,
         }
         else
         {
-            DBG2(DBG_KNL, "installing route: %H/%d via %H dev %s",
-                 dst_net, prefixlen, gateway, if_name);
-            INIT(route,
+        	INIT(route,
                 .if_name = strdup(if_name),
                 .gateway = gateway->clone(gateway),
                 .dst_net = dst_net->clone(dst_net),
@@ -212,17 +212,19 @@ static void manage_route(private_kernel_vpp_ipsec_t *this, bool add,
     }
     else
     {
-        if (!route_exist || ref_put(&route->refs) > 0)
+		DBG2(DBG_KNL, "uninstalling route: %H/%d via %H dev %s",
+             dst_net, prefixlen, gateway, if_name);
+        if (!route_exist)
         {
-			DBG2(DBG_KNL, "del route but it not exist or refs is %d", route->refs);
+			DBG2(DBG_KNL, "del route but it not exist");
             return;
         }
-        DBG2(DBG_KNL, "uninstalling route: %H/%d via %H dev %s",
-             dst_net, prefixlen, gateway, if_name);
-        this->routes->remove(this->routes, route, NULL);
-        route_destroy(route);
-        charon->kernel->del_route(charon->kernel, dst_net->get_address(dst_net),
-             prefixlen, gateway, dst, if_name);
+       	if (ref_put(&route->refs)) { 
+			this->routes->remove(this->routes, route, NULL);
+        	route_destroy(route);
+        	charon->kernel->del_route(charon->kernel, dst_net->get_address(dst_net),
+             	prefixlen, gateway, dst, if_name);
+		}
     }
 }
 
@@ -362,7 +364,7 @@ static uint32_t get_sw_if_index(char *interface)
     mp->_vl_msg_id = ntohs(VL_API_SW_INTERFACE_DUMP);
     mp->name_filter_valid = TRUE;
 	strncpy(mp->name_filter, interface, sizeof(mp->name_filter)-1);
-    if (vac->send(vac, (char *)mp, sizeof(*mp), &out, &out_len))
+    if (vac->send_dump(vac, (char *)mp, sizeof(*mp), &out, &out_len))
     {
         goto error;
     }
@@ -542,7 +544,7 @@ static int bypass_port(bool add, uint32_t spd_id, uint32_t sa_id,  uint16_t port
     int out_len;
     status_t rv = FAILED;
 
-	DBG2(DBG_KNL, "bypass_port [%s] spd_id %d port %d sa_id %d", add?"ADD":"DEL", spd_id, port, sa_id);
+	//DBG2(DBG_KNL, "bypass_port [%s] spd_id %d port %d sa_id %d", add?"ADD":"DEL", spd_id, port, sa_id);
 
     mp = vl_msg_api_alloc (sizeof (*mp));
     memset(mp, 0, sizeof(*mp));
@@ -636,7 +638,7 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
     spd_t *spd;
     char *out = NULL, *interface;
     int out_len;
-    uint32_t sw_if_index, spd_id, *sad_id;
+    uint32_t sw_if_index, spd_id, sad_id = ~0;
     status_t rv = FAILED;
     uint32_t priority, auto_priority;
     chunk_t src_from, src_to, dst_from, dst_to;
@@ -725,15 +727,16 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
                 .proto = data->sa->esp.use ? IPPROTO_ESP : IPPROTO_AH,
                 .spi = data->sa->esp.use ? data->sa->esp.spi : data->sa->ah.spi,
         };
-        sad_id = this->sas->get(this->sas, &id);
-        if (!sad_id)
+		sa_t *sa = NULL;
+        sa = this->sas->get(this->sas, &id);
+        if (!sa)
         {
             DBG1(DBG_KNL, "SA ID not found");
             goto error;
         }
-
+		sad_id = sa->sa_id;
 		if (n_spd) {
-			if (manage_bypass(TRUE, spd_id, sad_id))
+			if (manage_bypass(TRUE, spd_id, ~0))
         	{
             	DBG1(DBG_KNL, "manage_bypass %d failed!!!!", spd_id);
             	goto error;
@@ -741,7 +744,7 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
 		}
     }
 
-    mp->entry.sa_id = ntohl(*sad_id);
+    mp->entry.sa_id = ntohl(sad_id);
 	
 	bool is_ipv6 = false;
 	if (id->src_ts->get_type(id->src_ts) == TS_IPV6_ADDR_RANGE)
@@ -813,7 +816,7 @@ static status_t manage_policy(private_kernel_vpp_ipsec_t *this, bool add,
     } else {
         if (ref_put(&spd->policy_num))
         {
-        	DBG1(DBG_KNL, "policy_num's ref is 0, delete spd_id %d sw_if_index %d sad_id !!!!!!!!!!!!", spd->spd_id, spd->sw_if_index, sad_id);
+        	DBG1(DBG_KNL, "policy_num's ref is 0, delete spd_id %d sw_if_index %d sad_id %x", spd->spd_id, spd->sw_if_index, sad_id);
             interface_add_del_spd(FALSE, spd->spd_id, spd->sw_if_index);
             manage_bypass(FALSE, spd->spd_id, sad_id);
             spd_add_del(FALSE, spd->spd_id);
@@ -1053,6 +1056,7 @@ METHOD(kernel_ipsec_t, add_sa, status_t,
             .sa_id = sad_id,
             .mp = mp,
     );
+	DBG4(DBG_KNL, "put sa by its sa_id %x !!!!!!", sad_id);
     this->sas->put(this->sas, sa_id, sa);
     this->mutex->unlock(this->mutex);
     rv = SUCCESS;
@@ -1094,7 +1098,7 @@ METHOD(kernel_ipsec_t, query_sa, status_t,
     memset(mp, 0, sizeof(*mp));
     mp->_vl_msg_id = ntohs(VL_API_IPSEC_SA_DUMP);
     mp->sa_id = ntohl(sa->sa_id);
-    if (vac->send(vac, (char *)mp, sizeof(*mp), &out, &out_len))
+    if (vac->send_dump(vac, (char *)mp, sizeof(*mp), &out, &out_len))
     {
         DBG1(DBG_KNL, "vac SA dump failed");
         goto error;

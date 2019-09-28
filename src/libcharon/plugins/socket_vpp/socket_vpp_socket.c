@@ -199,7 +199,7 @@ METHOD(socket_t, receiver, status_t,
             DBG1(DBG_NET, "error reading vpp socket: %s", strerror(errno));
             return FAILED;
         }
-        DBG3(DBG_NET, "**received vpp packet %b", buf, bytes_read);
+        //DBG3(DBG_NET, "**received vpp packet %b", buf, bytes_read);
 
         raw = chunk_create(buf, bytes_read);
         packet = ip_packet_create(raw);
@@ -247,7 +247,6 @@ METHOD(socket_t, sender, status_t,
         src->set_port(src, this->port);
     }
 
-    DBG3(DBG_NET, "**sending vpp data %b", data.ptr, data.len);
     DBG2(DBG_NET, "sending vpp packet: from %#H to %#H by sock %d", src, dst, this->sock);
 
     family = dst->get_family(dst);

@@ -271,7 +271,7 @@ static void vac_api_handler (private_vac_t *this, void *msg)
     }
     else
     {
-        DBG2(DBG_KNL, "received vac msg seq %u id %d len %d ", seq, id, l);
+        //DBG2(DBG_KNL, "received vac msg seq %u id %d len %d ", seq, id, l);
         this->events_lock->lock(this->events_lock);
         event_id = (uintptr_t)id;
         event = this->events->get(this->events, (void*)event_id);
