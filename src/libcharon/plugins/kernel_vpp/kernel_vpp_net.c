@@ -256,33 +256,6 @@ static bool addr_in_subnet(chunk_t addr, int prefix, chunk_t net, int net_len)
     return TRUE;
 }
 
-static void get_vpp_ip_table(bool is_ip6, int *tab_id, char *tab_name)
-{
-	char *out;
-	int out_len, num, i;
-	vl_api_ip_table_dump_t *mp;
-	vl_api_ip_table_details_t *rmp;
-
-	mp = vl_msg_api_alloc(sizeof(*mp));
-	clib_memset(mp, 0, sizeof(*mp));
-	mp->_vl_msg_id = ntohs(VL_API_IP_TABLE_DUMP);
-	
-	if(vac->send(vac, (char *)mp, sizeof(*mp), &out, &out_len)) {
-		vl_msg_api_free(mp);
-		return;
-	}
-	vl_msg_api_free(mp);
-	num = out_len/sizeof(*rmp);
-	DBG2(DBG_KNL, "out_len is %d num is %d sizeof(*rmp) %d", out_len, num, sizeof(*rmp));
-	rmp = (vl_api_ip_table_details_t *)out;
-	for(i = 0; i < num; i++) {
-		if (i) rmp += 1;
-		strncpy(tab_name, rmp->table.name, 64);
-		*tab_id = rmp->table.table_id;
-		DBG2(DBG_KNL, "%d: table_id is %d is_ip6 %d name is %s", i, ntohl(rmp->table.table_id), rmp->table.is_ip6, tab_name);
-	}
-}
-
 /**
  * Get a route: If "nexthop" the nexthop is returned, source addr otherwise
  */
@@ -335,21 +308,23 @@ static host_t *get_route(private_kernel_vpp_net_t *this, host_t *dest,
                 fp = rmp->route.paths;
                 for (i = 0; i < num; i++)
                 {
-					/*
-					DBG1(DBG_KNL, "addr %H/%d %d.%d.%d.%d len %d n_paths %d path [sw_if_index %d preference %d ]", 
+#define IS_IP4_ANY(a) (a[0]==0&&a[1]==0&&a[2]==0&a[3]==0)
+					if (fp->type == FIB_API_PATH_TYPE_DROP)
+                    {
+                        fp++;
+                        continue;
+                    }
+#if	0
+					DBG1(DBG_KNL, "addr_in_subnet : addr %H/%d %d.%d.%d.%d len %d n_paths %d fp [sw_if_index %d preference %d nh %d.%d.%d.%d ]", 
 						dest, prefix, 
 						rmp->route.prefix.address.un.ip4[0],
 						rmp->route.prefix.address.un.ip4[1],
 						rmp->route.prefix.address.un.ip4[2],
 						rmp->route.prefix.address.un.ip4[3],
-						rmp->route.prefix.len, num, path.sw_if_index, path.preference);
-					*/
-                    if (fp->type == FIB_API_PATH_TYPE_DROP)
-                    {
-                        fp++;
-                        continue;
-                    }
-                    if ((fp->preference < path.preference) || (path.sw_if_index == ~0))
+						rmp->route.prefix.len, num, ntohl(fp->sw_if_index), fp->preference,
+						fp->nh.address.ip4[0], fp->nh.address.ip4[1], fp->nh.address.ip4[2],  fp->nh.address.ip4[3]);
+#endif               
+					if ((fp->preference < path.preference) || (path.sw_if_index == ~0) || IS_IP4_ANY(path.next_hop.ptr))
                     {
                         path.sw_if_index = ntohl(fp->sw_if_index);
                         path.preference = fp->preference;
@@ -367,11 +342,13 @@ static host_t *get_route(private_kernel_vpp_net_t *this, host_t *dest,
 		DBG1(DBG_KNL, "not yet support ip6");
 		return NULL;
     }
-
-	//DBG1(DBG_KNL, "find path preference %d sw_if_index %d next_hop %d.%d.%d.%d len %d", 
-	//	path.preference, path.sw_if_index,
-	//	path.next_hop.ptr[0], path.next_hop.ptr[1], path.next_hop.ptr[2], path.next_hop.ptr[3], path.next_hop.len);
-    if (path.next_hop.len)
+	
+	/*
+	DBG1(DBG_KNL, "find path preference %d sw_if_index %d next_hop %d.%d.%d.%d len %d", 
+		path.preference, path.sw_if_index,
+		path.next_hop.ptr[0], path.next_hop.ptr[1], path.next_hop.ptr[2], path.next_hop.ptr[3], path.next_hop.len);
+    */
+	if (path.next_hop.len)
     {
         if (nexthop)
         {

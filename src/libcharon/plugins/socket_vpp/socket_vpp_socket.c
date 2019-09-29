@@ -206,6 +206,7 @@ METHOD(socket_t, receiver, status_t,
         if (!packet)
         {
             DBG1(DBG_NET, "invalid IP packet read from vpp socket");
+			return FAILED;
         }
         src = packet->get_source(packet);
         dst = packet->get_destination(packet);
@@ -220,6 +221,7 @@ METHOD(socket_t, receiver, status_t,
     }
     else
     {
+		DBG1(DBG_NET, "received : impossible here");
         return FAILED;
     }
 
