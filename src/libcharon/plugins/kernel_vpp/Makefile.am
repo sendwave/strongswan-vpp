@@ -1,8 +1,7 @@
 AM_CPPFLAGS = \
     -I${linux_headers} \
     -I$(top_srcdir)/src/libstrongswan \
-    -I$(top_srcdir)/src/libcharon \
-	-I/root/vpp/build-root/install-vpp_debug-native/vpp/include
+    -I$(top_srcdir)/src/libcharon
 
 
 AM_CFLAGS = \
